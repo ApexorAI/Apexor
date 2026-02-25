@@ -62,18 +62,14 @@ export default function Home() {
         return;
       }
 
-      const { data, error } = await supabase.auth.getUser();
+      const { data } = await supabase.auth.getUser();
 
-      if (error) {
-        setMsg(`Auth error: ${error.message}`);
-        setLoading(false);
-        return;
-      }
-
-      if (!data.user) {
-        router.push("/login");
-        return;
-      }
+// If no logged-in user, always go to login.
+// (This also fixes the "Auth session missing" case on production.)
+if (!data.user) {
+  router.push("/login");
+  return;
+}
 
       setUserId(data.user.id);
     }
