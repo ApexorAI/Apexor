@@ -49,6 +49,33 @@ export default function Home() {
     [logs, todayYMD]
   );
 
+  // Weekly summary (last 7 days incl today)
+  const weekSummary = useMemo(() => {
+    const start = new Date();
+    start.setDate(start.getDate() - 6); // today + 6 previous = 7 days
+    const startYMD = toYMD(start);
+
+    const last7 = logs.filter((l) => l.log_date >= startYMD);
+
+    const totals = last7.reduce(
+      (acc, l) => {
+        acc.calls += l.calls;
+        acc.meetings += l.meetings;
+        acc.skill += l.skill_minutes;
+        return acc;
+      },
+      { calls: 0, meetings: 0, skill: 0 }
+    );
+
+    return {
+      daysLogged: last7.length,
+      calls: totals.calls,
+      meetings: totals.meetings,
+      skill: totals.skill,
+      startYMD,
+    };
+  }, [logs]);
+
   // 1) Check auth on load
   useEffect(() => {
     async function boot() {
@@ -64,12 +91,11 @@ export default function Home() {
 
       const { data } = await supabase.auth.getUser();
 
-// If no logged-in user, always go to login.
-// (This also fixes the "Auth session missing" case on production.)
-if (!data.user) {
-  router.push("/login");
-  return;
-}
+      // Always redirect to login if not logged in (fixes prod "session missing" situations)
+      if (!data.user) {
+        router.push("/login");
+        return;
+      }
 
       setUserId(data.user.id);
     }
@@ -180,6 +206,26 @@ if (!data.user) {
           />
         )}
 
+        <h2 style={{ ...styles.h2, marginTop: 28 }}>
+          Weekly summary (last 7 days)
+        </h2>
+
+        {loading ? (
+          <div>Loading…</div>
+        ) : (
+          <>
+            <div style={{ opacity: 0.7, marginBottom: 10 }}>
+              From {weekSummary.startYMD} to {todayYMD}
+            </div>
+            <div style={styles.grid}>
+              <Stat label="Days logged" value={weekSummary.daysLogged} />
+              <Stat label="Calls" value={weekSummary.calls} />
+              <Stat label="Meetings" value={weekSummary.meetings} />
+              <Stat label="Skill minutes" value={weekSummary.skill} />
+            </div>
+          </>
+        )}
+
         <h2 style={{ ...styles.h2, marginTop: 28 }}>Past logs</h2>
 
         {loading ? (
@@ -253,7 +299,6 @@ function TodayForm({
   const [notes, setNotes] = useState(defaultNotes ?? "");
   const [saving, setSaving] = useState(false);
 
-  // If you click Edit after a refresh, make sure the form pre-fills correctly
   useEffect(() => {
     setCalls(defaultCalls);
     setMeetings(defaultMeetings);
