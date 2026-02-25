@@ -39,6 +39,18 @@ function toYMD(d = new Date()) {
   return `${year}-${month}-${day}`;
 }
 
+// Safer local date parsing (noon avoids DST weirdness)
+function ymdToDateLocal(ymd: string) {
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(y, (m ?? 1) - 1, d ?? 1, 12, 0, 0);
+}
+
+function addDays(ymd: string, delta: number) {
+  const dt = ymdToDateLocal(ymd);
+  dt.setDate(dt.getDate() + delta);
+  return toYMD(dt);
+}
+
 function clampPct(n: number) {
   if (!Number.isFinite(n)) return 0;
   return Math.max(0, Math.min(100, n));
@@ -47,6 +59,14 @@ function clampPct(n: number) {
 function pct(value: number, target: number) {
   if (target <= 0) return 0;
   return clampPct(Math.round((value / target) * 100));
+}
+
+function hitCountForDay(l: DailyLog) {
+  let hits = 0;
+  if (l.calls >= TARGETS.calls) hits++;
+  if (l.meetings >= TARGETS.meetings) hits++;
+  if (l.skill_minutes >= TARGETS.skill_minutes) hits++;
+  return hits;
 }
 
 export default function Home() {
@@ -92,6 +112,35 @@ export default function Home() {
       startYMD,
     };
   }, [logs]);
+
+  // ✅ Streak: counts if HIT >= 2 out of 3 targets
+  const streak = useMemo(() => {
+    if (!logs.length) return { current: 0, lastCountedDay: null as string | null };
+
+    const byDate = new Map<string, number>();
+    for (const l of logs) byDate.set(l.log_date, hitCountForDay(l));
+
+    const countsAsStreakDay = (ymd: string) => (byDate.get(ymd) ?? 0) >= 2;
+
+    const yesterday = addDays(todayYMD, -1);
+
+    let anchor: string | null = null;
+    if (countsAsStreakDay(todayYMD)) anchor = todayYMD;
+    else if (countsAsStreakDay(yesterday)) anchor = yesterday;
+    else return { current: 0, lastCountedDay: null };
+
+    let count = 0;
+    let cursor = anchor;
+
+    // Hard safety limit: 365 days
+    for (let i = 0; i < 365; i++) {
+      if (!countsAsStreakDay(cursor)) break;
+      count++;
+      cursor = addDays(cursor, -1); // ALWAYS move back one day
+    }
+
+    return { current: count, lastCountedDay: anchor };
+  }, [logs, todayYMD]);
 
   // 1) Check auth on load
   useEffect(() => {
@@ -179,29 +228,9 @@ export default function Home() {
       callsHit: todayLog.calls >= TARGETS.calls,
       meetingsHit: todayLog.meetings >= TARGETS.meetings,
       skillHit: todayLog.skill_minutes >= TARGETS.skill_minutes,
+      hits: hitCountForDay(todayLog),
     };
   }, [todayLog]);
-
-  const weeklyTargets = useMemo(() => {
-    // weekly targets = daily targets * 7
-    const weekly = {
-      calls: TARGETS.calls * 7,
-      meetings: TARGETS.meetings * 7,
-      skill: TARGETS.skill_minutes * 7,
-    };
-
-    return {
-      callsTarget: weekly.calls,
-      meetingsTarget: weekly.meetings,
-      skillTarget: weekly.skill,
-      callsPct: pct(weekSummary.calls, weekly.calls),
-      meetingsPct: pct(weekSummary.meetings, weekly.meetings),
-      skillPct: pct(weekSummary.skill, weekly.skill),
-      callsHit: weekSummary.calls >= weekly.calls,
-      meetingsHit: weekSummary.meetings >= weekly.meetings,
-      skillHit: weekSummary.skill >= weekly.skill,
-    };
-  }, [weekSummary]);
 
   return (
     <div style={styles.page}>
@@ -211,7 +240,14 @@ export default function Home() {
             <h1 style={styles.h1}>Apexor</h1>
             <p style={styles.sub}>Daily performance log</p>
           </div>
-          <div style={styles.pill}>{todayYMD}</div>
+
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
+            <div style={styles.pill}>{todayYMD}</div>
+            <div style={styles.streakPill}>
+              🔥 Streak:{" "}
+              {streak.current > 0 ? `${streak.current} day${streak.current === 1 ? "" : "s"}` : "0"}
+            </div>
+          </div>
         </div>
 
         {msg ? <div style={styles.noteBox}>{msg}</div> : null}
@@ -224,6 +260,16 @@ export default function Home() {
           <div style={{ opacity: 0.7 }}>Checking login…</div>
         ) : todayLog && !editingToday ? (
           <>
+            <div style={{ marginBottom: 10, opacity: 0.75 }}>
+              Streak day rule: hit <strong>2 out of 3</strong> targets (calls / meetings / skill)
+              {todayTargets ? (
+                <>
+                  {" "}
+                  • Today hits: <strong>{todayTargets.hits}/3</strong>
+                </>
+              ) : null}
+            </div>
+
             <div style={styles.grid}>
               <TargetStat
                 label="Calls"
@@ -278,9 +324,7 @@ export default function Home() {
           />
         )}
 
-        <h2 style={{ ...styles.h2, marginTop: 28 }}>
-          Weekly summary (last 7 days)
-        </h2>
+        <h2 style={{ ...styles.h2, marginTop: 28 }}>Weekly summary (last 7 days)</h2>
 
         {loading ? (
           <div>Loading…</div>
@@ -289,6 +333,7 @@ export default function Home() {
             <div style={{ opacity: 0.7, marginBottom: 10 }}>
               From {weekSummary.startYMD} to {todayYMD}
             </div>
+
             <div style={styles.grid}>
               <div style={styles.stat}>
                 <div style={styles.statLabel}>Days logged</div>
@@ -301,23 +346,23 @@ export default function Home() {
               <TargetStat
                 label="Calls"
                 value={weekSummary.calls}
-                target={weeklyTargets.callsTarget}
-                percent={weeklyTargets.callsPct}
-                hit={weeklyTargets.callsHit}
+                target={TARGETS.calls * 7}
+                percent={pct(weekSummary.calls, TARGETS.calls * 7)}
+                hit={weekSummary.calls >= TARGETS.calls * 7}
               />
               <TargetStat
                 label="Meetings"
                 value={weekSummary.meetings}
-                target={weeklyTargets.meetingsTarget}
-                percent={weeklyTargets.meetingsPct}
-                hit={weeklyTargets.meetingsHit}
+                target={TARGETS.meetings * 7}
+                percent={pct(weekSummary.meetings, TARGETS.meetings * 7)}
+                hit={weekSummary.meetings >= TARGETS.meetings * 7}
               />
               <TargetStat
                 label="Skill minutes"
                 value={weekSummary.skill}
-                target={weeklyTargets.skillTarget}
-                percent={weeklyTargets.skillPct}
-                hit={weeklyTargets.skillHit}
+                target={TARGETS.skill_minutes * 7}
+                percent={pct(weekSummary.skill, TARGETS.skill_minutes * 7)}
+                hit={weekSummary.skill >= TARGETS.skill_minutes * 7}
               />
             </div>
           </>
@@ -392,7 +437,14 @@ function TargetStat({
         />
       </div>
 
-      <div style={{ marginTop: 8, fontSize: 12, fontWeight: 700, color: hit ? "#16a34a" : "#ef4444" }}>
+      <div
+        style={{
+          marginTop: 8,
+          fontSize: 12,
+          fontWeight: 700,
+          color: hit ? "#16a34a" : "#ef4444",
+        }}
+      >
         {hit ? "HIT" : "MISS"}
       </div>
     </div>
@@ -553,6 +605,14 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 999,
     fontSize: 12,
   },
+  streakPill: {
+    padding: "6px 10px",
+    background: "#f3f4f6",
+    color: "#111827",
+    borderRadius: 999,
+    fontSize: 12,
+    border: "1px solid #e5e7eb",
+  },
   h2: { margin: "18px 0 10px", fontSize: 18 },
   grid: {
     display: "grid",
@@ -595,8 +655,20 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: "center",
   },
   label: { fontSize: 13, opacity: 0.85 },
-  input: { padding: "10px 12px", borderRadius: 10, border: "1px solid #d1d5db", outline: "none" },
-  textarea: { padding: "10px 12px", borderRadius: 10, border: "1px solid #d1d5db", outline: "none", minHeight: 70, resize: "vertical" },
+  input: {
+    padding: "10px 12px",
+    borderRadius: 10,
+    border: "1px solid #d1d5db",
+    outline: "none",
+  },
+  textarea: {
+    padding: "10px 12px",
+    borderRadius: 10,
+    border: "1px solid #d1d5db",
+    outline: "none",
+    minHeight: 70,
+    resize: "vertical",
+  },
   button: {
     padding: "10px 14px",
     borderRadius: 10,
@@ -606,9 +678,29 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
     fontWeight: 600,
   },
-  tableWrap: { overflowX: "auto", border: "1px solid #e5e7eb", borderRadius: 12 },
+  tableWrap: {
+    overflowX: "auto",
+    border: "1px solid #e5e7eb",
+    borderRadius: 12,
+  },
   table: { width: "100%", borderCollapse: "collapse" },
-  th: { textAlign: "left", padding: 12, fontSize: 12, background: "#f3f4f6", borderBottom: "1px solid #e5e7eb" },
-  td: { padding: 12, borderBottom: "1px solid #f1f5f9", fontSize: 13 },
-  noteBox: { padding: 12, borderRadius: 12, background: "#ecfeff", border: "1px solid #a5f3fc", marginBottom: 12 },
+  th: {
+    textAlign: "left",
+    padding: 12,
+    fontSize: 12,
+    background: "#f3f4f6",
+    borderBottom: "1px solid #e5e7eb",
+  },
+  td: {
+    padding: 12,
+    borderBottom: "1px solid #f1f5f9",
+    fontSize: 13,
+  },
+  noteBox: {
+    padding: 12,
+    borderRadius: 12,
+    background: "#ecfeff",
+    border: "1px solid #a5f3fc",
+    marginBottom: 12,
+  },
 };
