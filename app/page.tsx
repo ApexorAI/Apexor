@@ -12,13 +12,19 @@ const supabase = createClient(supabaseUrl, supabaseAnonKey);
 /** Targets */
 const TARGETS = { calls: 40, meetings: 1, skill_minutes: 240 };
 
+/** Input caps (integrity) */
+const CAPS = { calls: 500, meetings: 20, skill_minutes: 600 };
+
 /** Score weights (sum 100) */
 const WEIGHTS = { calls: 33, meetings: 33, skill: 34 };
+
+/** XP settings */
+const XP_PER_SCORE = 10; // daily xp gain = score * 10
 
 type DailyLog = {
   id: string;
   user_id: string;
-  log_date: string; // YYYY-MM-DD
+  log_date: string;
   calls: number;
   meetings: number;
   skill_minutes: number;
@@ -26,7 +32,14 @@ type DailyLog = {
   created_at: string;
 };
 
-/** Date helpers (safe) */
+type Profile = {
+  id: string;
+  total_xp: number;
+  created_at: string;
+  updated_at: string;
+};
+
+/** Date helpers */
 function toYMD(d = new Date()) {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -35,7 +48,7 @@ function toYMD(d = new Date()) {
 }
 function ymdToDateLocal(ymd: string) {
   const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, (m ?? 1) - 1, d ?? 1, 12, 0, 0); // noon avoids DST bugs
+  return new Date(y, (m ?? 1) - 1, d ?? 1, 12, 0, 0);
 }
 function addDays(ymd: string, delta: number) {
   const dt = ymdToDateLocal(ymd);
@@ -46,6 +59,10 @@ function addDays(ymd: string, delta: number) {
 /** Math helpers */
 function clamp01(x: number) {
   return Math.max(0, Math.min(1, Number.isFinite(x) ? x : 0));
+}
+function clampInt(x: number, min: number, max: number) {
+  const n = Number.isFinite(x) ? Math.floor(x) : min;
+  return Math.max(min, Math.min(max, n));
 }
 function clampPct(x: number) {
   return Math.max(0, Math.min(100, Number.isFinite(x) ? x : 0));
@@ -58,6 +75,15 @@ function avg(nums: number[]) {
   return nums.length ? Math.round(nums.reduce((a, b) => a + b, 0) / nums.length) : 0;
 }
 
+/** Integrity: normalize inputs */
+function normalizeInputs(raw: { calls: number; meetings: number; skill_minutes: number }) {
+  return {
+    calls: clampInt(raw.calls, 0, CAPS.calls),
+    meetings: clampInt(raw.meetings, 0, CAPS.meetings),
+    skill_minutes: clampInt(raw.skill_minutes, 0, CAPS.skill_minutes),
+  };
+}
+
 /** Business logic */
 function hitCount(l: DailyLog) {
   let hits = 0;
@@ -67,7 +93,7 @@ function hitCount(l: DailyLog) {
   return hits;
 }
 function isStreakDay(l: DailyLog) {
-  return hitCount(l) >= 2; // your rule
+  return hitCount(l) >= 2;
 }
 function score(l: DailyLog) {
   const c = clamp01(l.calls / TARGETS.calls) * WEIGHTS.calls;
@@ -75,31 +101,57 @@ function score(l: DailyLog) {
   const s = clamp01(l.skill_minutes / TARGETS.skill_minutes) * WEIGHTS.skill;
   return Math.round(c + m + s);
 }
+function xpFromScore(s: number) {
+  return clampInt(s, 0, 100) * XP_PER_SCORE;
+}
 
-/** Tiny “chart” */
+/** Leveling */
+function levelFromXp(totalXp: number) {
+  // Simple growth curve: level up every 500xp for early game, then slowly increases
+  // thresholds: 0, 500, 1100, 1800, 2600, ...
+  let level = 1;
+  let need = 0;
+  let step = 500;
+  while (totalXp >= need + step) {
+    need += step;
+    level++;
+    step = Math.round(step * 1.2); // 20% harder each level
+    if (level > 1000) break;
+  }
+  const nextNeed = need + step;
+  const into = totalXp - need;
+  const pctToNext = Math.round((into / step) * 100);
+  return { level, need, nextNeed, into, step, pctToNext: clampPct(pctToNext) };
+}
+
+/** Achievements */
+type Achievement = {
+  id: string;
+  title: string;
+  desc: string;
+  done: boolean;
+  progressText: string;
+};
+
 function Sparkline({ values }: { values: number[] }) {
   const w = 140;
   const h = 36;
   if (!values.length) return <div style={{ opacity: 0.6 }}>No data</div>;
-
   const min = Math.min(...values);
   const max = Math.max(...values);
   const range = Math.max(1, max - min);
-
   const pts = values.map((v, i) => {
     const x = (i / Math.max(1, values.length - 1)) * w;
     const y = h - ((v - min) / range) * h;
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   });
-
   return (
-    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} aria-label="sparkline">
+    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`}>
       <polyline fill="none" stroke="currentColor" strokeWidth="2" points={pts.join(" ")} opacity="0.9" />
     </svg>
   );
 }
 
-/** Benchmarks calendar: last 14 days */
 function CalendarGrid({ todayYMD, logs }: { todayYMD: string; logs: DailyLog[] }) {
   const byDate = useMemo(() => {
     const m = new Map<string, DailyLog>();
@@ -125,7 +177,6 @@ function CalendarGrid({ todayYMD, logs }: { todayYMD: string; logs: DailyLog[] }
         const hits = l ? hitCount(l) : 0;
         const sc = l ? score(l) : 0;
 
-        // color by hits
         let bg = "#fee2e2";
         let border = "#fecaca";
         if (hits === 1) {
@@ -154,6 +205,8 @@ export default function Page() {
   const todayYMD = useMemo(() => toYMD(new Date()), []);
 
   const [userId, setUserId] = useState<string | null>(null);
+  const [profile, setProfile] = useState<Profile | null>(null);
+
   const [logs, setLogs] = useState<DailyLog[]>([]);
   const [loading, setLoading] = useState(true);
   const [msg, setMsg] = useState("");
@@ -162,7 +215,7 @@ export default function Page() {
 
   const todayLog = useMemo(() => logs.find((l) => l.log_date === todayYMD) ?? null, [logs, todayYMD]);
 
-  // Auth boot
+  // Auth boot + ensure profile exists
   useEffect(() => {
     async function boot() {
       setMsg("");
@@ -171,7 +224,29 @@ export default function Page() {
         router.push("/login");
         return;
       }
-      setUserId(data.user.id);
+      const uid = data.user.id;
+      setUserId(uid);
+
+      // Ensure profile row exists
+      const { data: prof, error: pErr } = await supabase.from("profiles").select("*").eq("id", uid).maybeSingle();
+      if (pErr) {
+        setMsg(`Profile error: ${pErr.message}`);
+        return;
+      }
+      if (!prof) {
+        const { data: created, error: cErr } = await supabase
+          .from("profiles")
+          .insert([{ id: uid, total_xp: 0 }])
+          .select("*")
+          .single();
+        if (cErr) {
+          setMsg(`Profile create error: ${cErr.message}`);
+          return;
+        }
+        setProfile(created as Profile);
+      } else {
+        setProfile(prof as Profile);
+      }
     }
     boot();
   }, [router]);
@@ -218,6 +293,23 @@ export default function Page() {
     setLogs((data as DailyLog[]) ?? []);
   }
 
+  async function addXp(amount: number) {
+    if (!profile) return;
+    const newTotal = Number(profile.total_xp) + amount;
+    const { data, error } = await supabase
+      .from("profiles")
+      .update({ total_xp: newTotal, updated_at: new Date().toISOString() })
+      .eq("id", profile.id)
+      .select("*")
+      .single();
+
+    if (error) {
+      setMsg(`XP update error: ${error.message}`);
+      return;
+    }
+    setProfile(data as Profile);
+  }
+
   // Weekly windows
   const start7 = useMemo(() => addDays(todayYMD, -6), [todayYMD]);
   const prevStart7 = useMemo(() => addDays(start7, -7), [start7]);
@@ -228,7 +320,6 @@ export default function Page() {
     [logs, prevStart7, start7]
   );
 
-  // Weekly totals + avg score
   const weekly = useMemo(() => {
     const totals = last7.reduce(
       (a, l) => {
@@ -243,7 +334,6 @@ export default function Page() {
     return { ...totals, avgScore, daysLogged: last7.length };
   }, [last7]);
 
-  // Trend (avg score last7 vs prev7)
   const trend = useMemo(() => {
     const lastAvg = avg(last7.map(score));
     const prevAvg = avg(prev7.map(score));
@@ -251,7 +341,6 @@ export default function Page() {
     return { lastAvg, prevAvg, delta, dir: delta > 0 ? "up" : delta < 0 ? "down" : "flat" };
   }, [last7, prev7]);
 
-  // Streak (2/3 targets) — safe loop
   const streak = useMemo(() => {
     if (!logs.length) return 0;
 
@@ -281,7 +370,6 @@ export default function Page() {
     return count;
   }, [logs, todayYMD]);
 
-  // Today stats
   const todayStats = useMemo(() => {
     if (!todayLog) return null;
     return {
@@ -290,17 +378,72 @@ export default function Page() {
       callsPct: pct(todayLog.calls, TARGETS.calls),
       meetingsPct: pct(todayLog.meetings, TARGETS.meetings),
       skillPct: pct(todayLog.skill_minutes, TARGETS.skill_minutes),
+      xp: xpFromScore(score(todayLog)),
     };
   }, [todayLog]);
 
-  // Sparkline values (last 14 days)
   const sparkValues = useMemo(() => {
     const start14 = addDays(todayYMD, -13);
-    const slice = logs
-      .filter((l) => l.log_date >= start14)
-      .sort((a, b) => a.log_date.localeCompare(b.log_date));
+    const slice = logs.filter((l) => l.log_date >= start14).sort((a, b) => a.log_date.localeCompare(b.log_date));
     return slice.map(score);
   }, [logs, todayYMD]);
+
+  const levelInfo = useMemo(() => levelFromXp(profile?.total_xp ?? 0), [profile?.total_xp]);
+
+  // Leaderboard (you-only for now)
+  const bestThisWeek = useMemo(() => {
+    if (!last7.length) return 0;
+    return Math.max(...last7.map(score));
+  }, [last7]);
+
+  // Achievements (computed, not stored yet)
+  const achievements: Achievement[] = useMemo(() => {
+    const hasAnyLog = logs.length > 0;
+    const threeDayStreak = streak >= 3;
+    const sevenDayStreak = streak >= 7;
+
+    const hit33 = todayLog ? hitCount(todayLog) === 3 : false;
+
+    const logged7Days = last7.length >= 7;
+
+    return [
+      {
+        id: "first-log",
+        title: "First Log",
+        desc: "Create your first daily log.",
+        done: hasAnyLog,
+        progressText: hasAnyLog ? "Done" : "0/1",
+      },
+      {
+        id: "hit-3of3",
+        title: "Perfect Day",
+        desc: "Hit 3/3 targets in a day.",
+        done: !!hit33,
+        progressText: hit33 ? "Done" : "Not yet",
+      },
+      {
+        id: "streak-3",
+        title: "Streak x3",
+        desc: "Get a 3-day streak (2/3 targets).",
+        done: threeDayStreak,
+        progressText: `${Math.min(streak, 3)}/3`,
+      },
+      {
+        id: "streak-7",
+        title: "Streak x7",
+        desc: "Get a 7-day streak (2/3 targets).",
+        done: sevenDayStreak,
+        progressText: `${Math.min(streak, 7)}/7`,
+      },
+      {
+        id: "week-complete",
+        title: "Full Week Logged",
+        desc: "Log 7 days in the last 7-day window.",
+        done: logged7Days,
+        progressText: `${Math.min(last7.length, 7)}/7`,
+      },
+    ];
+  }, [logs, last7.length, streak, todayLog]);
 
   return (
     <div style={styles.page}>
@@ -308,7 +451,7 @@ export default function Page() {
         <div style={styles.headerRow}>
           <div>
             <h1 style={styles.h1}>Apexor</h1>
-            <p style={styles.sub}>Phase 2 – Performance Intelligence</p>
+            <p style={styles.sub}>Phase 3 – Gamification (Bundle v1)</p>
           </div>
 
           <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
@@ -318,6 +461,29 @@ export default function Page() {
         </div>
 
         {msg ? <div style={styles.noteBox}>{msg}</div> : null}
+
+        {/* Level block */}
+        <div style={styles.levelRow}>
+          <div style={styles.levelBox}>
+            <div style={{ opacity: 0.75, fontSize: 12 }}>Level</div>
+            <div style={{ fontSize: 26, fontWeight: 900 }}>{levelInfo.level}</div>
+            <div style={{ opacity: 0.75, fontSize: 12 }}>Total XP: {profile?.total_xp ?? 0}</div>
+          </div>
+          <div style={styles.levelBox}>
+            <div style={{ opacity: 0.75, fontSize: 12 }}>To next level</div>
+            <div style={{ fontSize: 18, fontWeight: 800 }}>
+              {levelInfo.into}/{levelInfo.step} ({levelInfo.pctToNext}%)
+            </div>
+            <div style={styles.progressOuter}>
+              <div style={{ ...styles.progressInner, width: `${levelInfo.pctToNext}%`, background: "#111827" }} />
+            </div>
+          </div>
+          <div style={styles.levelBox}>
+            <div style={{ opacity: 0.75, fontSize: 12 }}>Weekly best</div>
+            <div style={{ fontSize: 26, fontWeight: 900 }}>{bestThisWeek}</div>
+            <div style={{ opacity: 0.75, fontSize: 12 }}>Best daily score (last 7)</div>
+          </div>
+        </div>
 
         {/* Trend + chart */}
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
@@ -333,7 +499,6 @@ export default function Page() {
           </div>
         </div>
 
-        {/* Benchmarks calendar */}
         <h2 style={styles.h2}>Benchmarks (last 14 days)</h2>
         {loading ? <div>Loading…</div> : <CalendarGrid todayYMD={todayYMD} logs={logs} />}
 
@@ -346,25 +511,14 @@ export default function Page() {
         ) : todayLog && !editingToday ? (
           <>
             <div style={{ marginBottom: 10, opacity: 0.75 }}>
-              Rule: streak day = hit <strong>2/3</strong> targets • Hits:{" "}
-              <strong>{todayStats?.hits ?? 0}/3</strong> • Score:{" "}
-              <strong>{todayStats?.score ?? 0}/100</strong>
+              Rule: streak day = hit <strong>2/3</strong> targets • Hits: <strong>{todayStats?.hits ?? 0}/3</strong> • Score:{" "}
+              <strong>{todayStats?.score ?? 0}/100</strong> • XP today: <strong>+{todayStats?.xp ?? 0}</strong>
             </div>
 
             <div style={styles.grid}>
               <TargetStat label="Calls" value={todayLog.calls} target={TARGETS.calls} percent={todayStats?.callsPct ?? 0} />
-              <TargetStat
-                label="Meetings"
-                value={todayLog.meetings}
-                target={TARGETS.meetings}
-                percent={todayStats?.meetingsPct ?? 0}
-              />
-              <TargetStat
-                label="Skill minutes"
-                value={todayLog.skill_minutes}
-                target={TARGETS.skill_minutes}
-                percent={todayStats?.skillPct ?? 0}
-              />
+              <TargetStat label="Meetings" value={todayLog.meetings} target={TARGETS.meetings} percent={todayStats?.meetingsPct ?? 0} />
+              <TargetStat label="Skill minutes" value={todayLog.skill_minutes} target={TARGETS.skill_minutes} percent={todayStats?.skillPct ?? 0} />
               <div style={styles.stat}>
                 <div style={styles.statLabel}>Notes</div>
                 <div style={styles.statValueText}>{todayLog.notes ?? "-"}</div>
@@ -384,18 +538,34 @@ export default function Page() {
             defaultSkillMinutes={todayLog?.skill_minutes ?? 0}
             defaultNotes={todayLog?.notes ?? ""}
             onCancel={todayLog ? () => setEditingToday(false) : undefined}
-            onSaved={async () => {
+            onSaved={async (xpGained) => {
               setEditingToday(false);
-              setMsg("Saved!");
+              setMsg(`Saved! XP +${xpGained}`);
               await refetch();
-              setTimeout(() => setMsg(""), 1500);
+              await addXp(xpGained);
+              setTimeout(() => setMsg(""), 1800);
             }}
             onError={(e) => setMsg(e)}
           />
         )}
 
-        <h2 style={{ ...styles.h2, marginTop: 28 }}>Weekly analytics (last 7 days)</h2>
+        <h2 style={{ ...styles.h2, marginTop: 28 }}>Achievements</h2>
+        <div style={styles.achWrap}>
+          {achievements.map((a) => (
+            <div key={a.id} style={{ ...styles.achCard, borderColor: a.done ? "#86efac" : "#e5e7eb" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                <div style={{ fontWeight: 800 }}>{a.title}</div>
+                <div style={{ fontSize: 12, opacity: 0.75 }}>{a.progressText}</div>
+              </div>
+              <div style={{ fontSize: 12, opacity: 0.75, marginTop: 6 }}>{a.desc}</div>
+              <div style={{ marginTop: 10, fontWeight: 800, color: a.done ? "#16a34a" : "#6b7280" }}>
+                {a.done ? "UNLOCKED" : "LOCKED"}
+              </div>
+            </div>
+          ))}
+        </div>
 
+        <h2 style={{ ...styles.h2, marginTop: 28 }}>Weekly analytics (last 7 days)</h2>
         {loading ? (
           <div>Loading…</div>
         ) : (
@@ -406,12 +576,7 @@ export default function Page() {
 
             <div style={styles.grid}>
               <TargetStat label="Calls" value={weekly.calls} target={TARGETS.calls * 7} percent={pct(weekly.calls, TARGETS.calls * 7)} />
-              <TargetStat
-                label="Meetings"
-                value={weekly.meetings}
-                target={TARGETS.meetings * 7}
-                percent={pct(weekly.meetings, TARGETS.meetings * 7)}
-              />
+              <TargetStat label="Meetings" value={weekly.meetings} target={TARGETS.meetings * 7} percent={pct(weekly.meetings, TARGETS.meetings * 7)} />
               <TargetStat
                 label="Skill minutes"
                 value={weekly.skill}
@@ -430,7 +595,6 @@ export default function Page() {
         )}
 
         <h2 style={{ ...styles.h2, marginTop: 28 }}>Past logs</h2>
-
         {loading ? (
           <div>Loading…</div>
         ) : logs.length === 0 ? (
@@ -445,6 +609,7 @@ export default function Page() {
                   <th style={styles.th}>Meetings</th>
                   <th style={styles.th}>Skill</th>
                   <th style={styles.th}>Score</th>
+                  <th style={styles.th}>XP</th>
                   <th style={styles.th}>Notes</th>
                 </tr>
               </thead>
@@ -456,6 +621,7 @@ export default function Page() {
                     <td style={styles.td}>{l.meetings}</td>
                     <td style={styles.td}>{l.skill_minutes}</td>
                     <td style={styles.td}>{score(l)}</td>
+                    <td style={styles.td}>{xpFromScore(score(l))}</td>
                     <td style={styles.td}>{l.notes ?? "-"}</td>
                   </tr>
                 ))}
@@ -480,7 +646,7 @@ function TargetStat({ label, value, target, percent }: { label: string; value: n
       <div style={styles.progressOuter}>
         <div style={{ ...styles.progressInner, width: `${percent}%`, background: hit ? "#16a34a" : "#ef4444" }} />
       </div>
-      <div style={{ marginTop: 8, fontSize: 12, fontWeight: 700, color: hit ? "#16a34a" : "#ef4444" }}>
+      <div style={{ marginTop: 8, fontSize: 12, fontWeight: 900, color: hit ? "#16a34a" : "#ef4444" }}>
         {hit ? "HIT" : "MISS"}
       </div>
     </div>
@@ -505,7 +671,7 @@ function TodayForm({
   defaultSkillMinutes: number;
   defaultNotes: string;
   onCancel?: () => void;
-  onSaved: () => void;
+  onSaved: (xpGained: number) => void;
   onError: (msg: string) => void;
 }) {
   const [calls, setCalls] = useState(defaultCalls);
@@ -525,14 +691,33 @@ function TodayForm({
     onError("");
     setSaving(true);
 
+    const normalized = normalizeInputs({
+      calls,
+      meetings,
+      skill_minutes: skillMinutes,
+    });
+
+    const tempLog: DailyLog = {
+      id: "temp",
+      user_id: userId,
+      log_date: todayYMD,
+      calls: normalized.calls,
+      meetings: normalized.meetings,
+      skill_minutes: normalized.skill_minutes,
+      notes: notes.trim() ? notes.trim() : null,
+      created_at: new Date().toISOString(),
+    };
+
+    const xpGained = xpFromScore(score(tempLog));
+
     const { error } = await supabase.from("daily_logs").upsert(
       [
         {
           user_id: userId,
           log_date: todayYMD,
-          calls,
-          meetings,
-          skill_minutes: skillMinutes,
+          calls: normalized.calls,
+          meetings: normalized.meetings,
+          skill_minutes: normalized.skill_minutes,
           notes: notes.trim() ? notes.trim() : null,
         },
       ],
@@ -546,11 +731,15 @@ function TodayForm({
       return;
     }
 
-    onSaved();
+    onSaved(xpGained);
   }
 
   return (
     <div style={styles.form}>
+      <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 10 }}>
+        Caps: Calls ≤ {CAPS.calls}, Meetings ≤ {CAPS.meetings}, Skill ≤ {CAPS.skill_minutes}
+      </div>
+
       <div style={styles.formRow}>
         <label style={styles.label}>Calls</label>
         <input style={styles.input} type="number" value={calls} onChange={(e) => setCalls(Number(e.target.value))} />
@@ -563,7 +752,12 @@ function TodayForm({
 
       <div style={styles.formRow}>
         <label style={styles.label}>Skill minutes</label>
-        <input style={styles.input} type="number" value={skillMinutes} onChange={(e) => setSkillMinutes(Number(e.target.value))} />
+        <input
+          style={styles.input}
+          type="number"
+          value={skillMinutes}
+          onChange={(e) => setSkillMinutes(Number(e.target.value))}
+        />
       </div>
 
       <div style={styles.formRow}>
@@ -594,6 +788,10 @@ const styles: Record<string, React.CSSProperties> = {
   pill: { padding: "8px 12px", background: "#111827", color: "white", borderRadius: 999, fontSize: 12 },
   streakPill: { padding: "6px 10px", background: "#f3f4f6", color: "#111827", borderRadius: 999, fontSize: 12, border: "1px solid #e5e7eb" },
   h2: { margin: "18px 0 10px", fontSize: 18 },
+
+  levelRow: { display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 12, marginBottom: 14 },
+  levelBox: { border: "1px solid #e5e7eb", borderRadius: 12, padding: 12, background: "#fafafa" },
+
   grid: { display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 12, marginTop: 10 },
   stat: { border: "1px solid #e5e7eb", borderRadius: 12, padding: 12, background: "#fafafa" },
   statLabel: { fontSize: 12, opacity: 0.7, marginBottom: 6 },
@@ -604,6 +802,9 @@ const styles: Record<string, React.CSSProperties> = {
 
   calWrap: { marginTop: 10, display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 10 },
   calDay: { border: "1px solid", borderRadius: 12, padding: 10, minHeight: 72, display: "flex", flexDirection: "column", justifyContent: "space-between" },
+
+  achWrap: { display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 12, marginTop: 10 },
+  achCard: { border: "2px solid", borderRadius: 14, padding: 12, background: "white" },
 
   form: { border: "1px solid #e5e7eb", borderRadius: 12, padding: 14, background: "#fafafa", maxWidth: 520 },
   formRow: { display: "grid", gridTemplateColumns: "140px 1fr", gap: 10, marginBottom: 10, alignItems: "center" },
