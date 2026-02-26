@@ -67,7 +67,7 @@ function hitCount(l: DailyLog) {
   return hits;
 }
 function isStreakDay(l: DailyLog) {
-  return hitCount(l) >= 2; // your chosen rule
+  return hitCount(l) >= 2; // your rule
 }
 function score(l: DailyLog) {
   const c = clamp01(l.calls / TARGETS.calls) * WEIGHTS.calls;
@@ -93,9 +93,59 @@ function Sparkline({ values }: { values: number[] }) {
   });
 
   return (
-    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`}>
+    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} aria-label="sparkline">
       <polyline fill="none" stroke="currentColor" strokeWidth="2" points={pts.join(" ")} opacity="0.9" />
     </svg>
+  );
+}
+
+/** Benchmarks calendar: last 14 days */
+function CalendarGrid({ todayYMD, logs }: { todayYMD: string; logs: DailyLog[] }) {
+  const byDate = useMemo(() => {
+    const m = new Map<string, DailyLog>();
+    for (const l of logs) m.set(l.log_date, l);
+    return m;
+  }, [logs]);
+
+  const days = useMemo(() => {
+    const out: string[] = [];
+    const start = addDays(todayYMD, -13);
+    let cursor = start;
+    for (let i = 0; i < 14; i++) {
+      out.push(cursor);
+      cursor = addDays(cursor, 1);
+    }
+    return out;
+  }, [todayYMD]);
+
+  return (
+    <div style={styles.calWrap}>
+      {days.map((d) => {
+        const l = byDate.get(d) ?? null;
+        const hits = l ? hitCount(l) : 0;
+        const sc = l ? score(l) : 0;
+
+        // color by hits
+        let bg = "#fee2e2";
+        let border = "#fecaca";
+        if (hits === 1) {
+          bg = "#fef3c7";
+          border = "#fde68a";
+        }
+        if (hits >= 2) {
+          bg = "#dcfce7";
+          border = "#86efac";
+        }
+
+        return (
+          <div key={d} style={{ ...styles.calDay, background: bg, borderColor: border }}>
+            <div style={{ fontSize: 11, opacity: 0.75 }}>{d.slice(5)}</div>
+            <div style={{ fontWeight: 800, fontSize: 16 }}>{sc}</div>
+            <div style={{ fontSize: 11, opacity: 0.8 }}>{hits}/3</div>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -116,7 +166,6 @@ export default function Page() {
   useEffect(() => {
     async function boot() {
       setMsg("");
-
       const { data } = await supabase.auth.getUser();
       if (!data.user) {
         router.push("/login");
@@ -174,7 +223,10 @@ export default function Page() {
   const prevStart7 = useMemo(() => addDays(start7, -7), [start7]);
 
   const last7 = useMemo(() => logs.filter((l) => l.log_date >= start7), [logs, start7]);
-  const prev7 = useMemo(() => logs.filter((l) => l.log_date >= prevStart7 && l.log_date < start7), [logs, prevStart7, start7]);
+  const prev7 = useMemo(
+    () => logs.filter((l) => l.log_date >= prevStart7 && l.log_date < start7),
+    [logs, prevStart7, start7]
+  );
 
   // Weekly totals + avg score
   const weekly = useMemo(() => {
@@ -199,7 +251,7 @@ export default function Page() {
     return { lastAvg, prevAvg, delta, dir: delta > 0 ? "up" : delta < 0 ? "down" : "flat" };
   }, [last7, prev7]);
 
-  // Streak (2/3 targets)
+  // Streak (2/3 targets) — safe loop
   const streak = useMemo(() => {
     if (!logs.length) return 0;
 
@@ -241,7 +293,7 @@ export default function Page() {
     };
   }, [todayLog]);
 
-  // Chart values (last 14 days)
+  // Sparkline values (last 14 days)
   const sparkValues = useMemo(() => {
     const start14 = addDays(todayYMD, -13);
     const slice = logs
@@ -267,6 +319,7 @@ export default function Page() {
 
         {msg ? <div style={styles.noteBox}>{msg}</div> : null}
 
+        {/* Trend + chart */}
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
           <div style={{ fontSize: 13, opacity: 0.75 }}>
             Trend (avg score):{" "}
@@ -279,6 +332,10 @@ export default function Page() {
             <Sparkline values={sparkValues} />
           </div>
         </div>
+
+        {/* Benchmarks calendar */}
+        <h2 style={styles.h2}>Benchmarks (last 14 days)</h2>
+        {loading ? <div>Loading…</div> : <CalendarGrid todayYMD={todayYMD} logs={logs} />}
 
         <h2 style={styles.h2}>Today</h2>
 
@@ -296,8 +353,18 @@ export default function Page() {
 
             <div style={styles.grid}>
               <TargetStat label="Calls" value={todayLog.calls} target={TARGETS.calls} percent={todayStats?.callsPct ?? 0} />
-              <TargetStat label="Meetings" value={todayLog.meetings} target={TARGETS.meetings} percent={todayStats?.meetingsPct ?? 0} />
-              <TargetStat label="Skill minutes" value={todayLog.skill_minutes} target={TARGETS.skill_minutes} percent={todayStats?.skillPct ?? 0} />
+              <TargetStat
+                label="Meetings"
+                value={todayLog.meetings}
+                target={TARGETS.meetings}
+                percent={todayStats?.meetingsPct ?? 0}
+              />
+              <TargetStat
+                label="Skill minutes"
+                value={todayLog.skill_minutes}
+                target={TARGETS.skill_minutes}
+                percent={todayStats?.skillPct ?? 0}
+              />
               <div style={styles.stat}>
                 <div style={styles.statLabel}>Notes</div>
                 <div style={styles.statValueText}>{todayLog.notes ?? "-"}</div>
@@ -339,8 +406,18 @@ export default function Page() {
 
             <div style={styles.grid}>
               <TargetStat label="Calls" value={weekly.calls} target={TARGETS.calls * 7} percent={pct(weekly.calls, TARGETS.calls * 7)} />
-              <TargetStat label="Meetings" value={weekly.meetings} target={TARGETS.meetings * 7} percent={pct(weekly.meetings, TARGETS.meetings * 7)} />
-              <TargetStat label="Skill minutes" value={weekly.skill} target={TARGETS.skill_minutes * 7} percent={pct(weekly.skill, TARGETS.skill_minutes * 7)} />
+              <TargetStat
+                label="Meetings"
+                value={weekly.meetings}
+                target={TARGETS.meetings * 7}
+                percent={pct(weekly.meetings, TARGETS.meetings * 7)}
+              />
+              <TargetStat
+                label="Skill minutes"
+                value={weekly.skill}
+                target={TARGETS.skill_minutes * 7}
+                percent={pct(weekly.skill, TARGETS.skill_minutes * 7)}
+              />
               <div style={styles.stat}>
                 <div style={styles.statLabel}>Weekly targets</div>
                 <div style={styles.statValue}>7 days</div>
@@ -524,15 +601,21 @@ const styles: Record<string, React.CSSProperties> = {
   statValueText: { fontSize: 14, lineHeight: 1.3 },
   progressOuter: { marginTop: 8, height: 10, width: "100%", background: "#e5e7eb", borderRadius: 999, overflow: "hidden" },
   progressInner: { height: "100%", borderRadius: 999 },
+
+  calWrap: { marginTop: 10, display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))", gap: 10 },
+  calDay: { border: "1px solid", borderRadius: 12, padding: 10, minHeight: 72, display: "flex", flexDirection: "column", justifyContent: "space-between" },
+
   form: { border: "1px solid #e5e7eb", borderRadius: 12, padding: 14, background: "#fafafa", maxWidth: 520 },
   formRow: { display: "grid", gridTemplateColumns: "140px 1fr", gap: 10, marginBottom: 10, alignItems: "center" },
   label: { fontSize: 13, opacity: 0.85 },
   input: { padding: "10px 12px", borderRadius: 10, border: "1px solid #d1d5db", outline: "none" },
   textarea: { padding: "10px 12px", borderRadius: 10, border: "1px solid #d1d5db", outline: "none", minHeight: 70, resize: "vertical" },
   button: { padding: "10px 14px", borderRadius: 10, border: "none", background: "#111827", color: "white", cursor: "pointer", fontWeight: 600 },
+
   tableWrap: { overflowX: "auto", border: "1px solid #e5e7eb", borderRadius: 12, marginTop: 10 },
   table: { width: "100%", borderCollapse: "collapse" },
   th: { textAlign: "left", padding: 12, fontSize: 12, background: "#f3f4f6", borderBottom: "1px solid #e5e7eb" },
   td: { padding: 12, borderBottom: "1px solid #f1f5f9", fontSize: 13 },
+
   noteBox: { padding: 12, borderRadius: 12, background: "#ecfeff", border: "1px solid #a5f3fc", marginBottom: 12 },
 };
