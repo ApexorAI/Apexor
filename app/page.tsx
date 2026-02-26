@@ -4,22 +4,16 @@ import React, { useEffect, useMemo, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 import { useRouter } from "next/navigation";
 
-/**
- * REQUIRED: .env.local
- * NEXT_PUBLIC_SUPABASE_URL=...
- * NEXT_PUBLIC_SUPABASE_ANON_KEY=...
- */
+/** ENV */
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
-// Phase 2: targets (hardcoded for now)
-const TARGETS = {
-  calls: 40,
-  meetings: 1,
-  skill_minutes: 240,
-};
+/** Targets */
+const TARGETS = { calls: 40, meetings: 1, skill_minutes: 240 };
+
+/** Score weights (sum 100) */
+const WEIGHTS = { calls: 33, meetings: 33, skill: 34 };
 
 type DailyLog = {
   id: string;
@@ -32,150 +26,113 @@ type DailyLog = {
   created_at: string;
 };
 
+/** Date helpers (safe) */
 function toYMD(d = new Date()) {
-  const year = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
+  return `${y}-${m}-${day}`;
 }
-
-// Safer local date parsing (noon avoids DST weirdness)
 function ymdToDateLocal(ymd: string) {
   const [y, m, d] = ymd.split("-").map(Number);
-  return new Date(y, (m ?? 1) - 1, d ?? 1, 12, 0, 0);
+  return new Date(y, (m ?? 1) - 1, d ?? 1, 12, 0, 0); // noon avoids DST bugs
 }
-
 function addDays(ymd: string, delta: number) {
   const dt = ymdToDateLocal(ymd);
   dt.setDate(dt.getDate() + delta);
   return toYMD(dt);
 }
 
-function clampPct(n: number) {
-  if (!Number.isFinite(n)) return 0;
-  return Math.max(0, Math.min(100, n));
+/** Math helpers */
+function clamp01(x: number) {
+  return Math.max(0, Math.min(1, Number.isFinite(x) ? x : 0));
 }
-
+function clampPct(x: number) {
+  return Math.max(0, Math.min(100, Number.isFinite(x) ? x : 0));
+}
 function pct(value: number, target: number) {
   if (target <= 0) return 0;
   return clampPct(Math.round((value / target) * 100));
 }
+function avg(nums: number[]) {
+  return nums.length ? Math.round(nums.reduce((a, b) => a + b, 0) / nums.length) : 0;
+}
 
-function hitCountForDay(l: DailyLog) {
+/** Business logic */
+function hitCount(l: DailyLog) {
   let hits = 0;
   if (l.calls >= TARGETS.calls) hits++;
   if (l.meetings >= TARGETS.meetings) hits++;
   if (l.skill_minutes >= TARGETS.skill_minutes) hits++;
   return hits;
 }
+function isStreakDay(l: DailyLog) {
+  return hitCount(l) >= 2; // your chosen rule
+}
+function score(l: DailyLog) {
+  const c = clamp01(l.calls / TARGETS.calls) * WEIGHTS.calls;
+  const m = clamp01(l.meetings / TARGETS.meetings) * WEIGHTS.meetings;
+  const s = clamp01(l.skill_minutes / TARGETS.skill_minutes) * WEIGHTS.skill;
+  return Math.round(c + m + s);
+}
 
-export default function Home() {
+/** Tiny “chart” */
+function Sparkline({ values }: { values: number[] }) {
+  const w = 140;
+  const h = 36;
+  if (!values.length) return <div style={{ opacity: 0.6 }}>No data</div>;
+
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = Math.max(1, max - min);
+
+  const pts = values.map((v, i) => {
+    const x = (i / Math.max(1, values.length - 1)) * w;
+    const y = h - ((v - min) / range) * h;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+
+  return (
+    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`}>
+      <polyline fill="none" stroke="currentColor" strokeWidth="2" points={pts.join(" ")} opacity="0.9" />
+    </svg>
+  );
+}
+
+export default function Page() {
   const router = useRouter();
-
   const todayYMD = useMemo(() => toYMD(new Date()), []);
-  const [userId, setUserId] = useState<string | null>(null);
 
+  const [userId, setUserId] = useState<string | null>(null);
   const [logs, setLogs] = useState<DailyLog[]>([]);
   const [loading, setLoading] = useState(true);
-  const [msg, setMsg] = useState<string>("");
+  const [msg, setMsg] = useState("");
 
   const [editingToday, setEditingToday] = useState(false);
 
-  const todayLog = useMemo(
-    () => logs.find((l) => l.log_date === todayYMD) ?? null,
-    [logs, todayYMD]
-  );
+  const todayLog = useMemo(() => logs.find((l) => l.log_date === todayYMD) ?? null, [logs, todayYMD]);
 
-  // Weekly summary (last 7 days incl today)
-  const weekSummary = useMemo(() => {
-    const start = new Date();
-    start.setDate(start.getDate() - 6); // today + 6 previous = 7 days
-    const startYMD = toYMD(start);
-
-    const last7 = logs.filter((l) => l.log_date >= startYMD);
-
-    const totals = last7.reduce(
-      (acc, l) => {
-        acc.calls += l.calls;
-        acc.meetings += l.meetings;
-        acc.skill += l.skill_minutes;
-        return acc;
-      },
-      { calls: 0, meetings: 0, skill: 0 }
-    );
-
-    return {
-      daysLogged: last7.length,
-      calls: totals.calls,
-      meetings: totals.meetings,
-      skill: totals.skill,
-      startYMD,
-    };
-  }, [logs]);
-
-  // ✅ Streak: counts if HIT >= 2 out of 3 targets
-  const streak = useMemo(() => {
-    if (!logs.length) return { current: 0, lastCountedDay: null as string | null };
-
-    const byDate = new Map<string, number>();
-    for (const l of logs) byDate.set(l.log_date, hitCountForDay(l));
-
-    const countsAsStreakDay = (ymd: string) => (byDate.get(ymd) ?? 0) >= 2;
-
-    const yesterday = addDays(todayYMD, -1);
-
-    let anchor: string | null = null;
-    if (countsAsStreakDay(todayYMD)) anchor = todayYMD;
-    else if (countsAsStreakDay(yesterday)) anchor = yesterday;
-    else return { current: 0, lastCountedDay: null };
-
-    let count = 0;
-    let cursor = anchor;
-
-    // Hard safety limit: 365 days
-    for (let i = 0; i < 365; i++) {
-      if (!countsAsStreakDay(cursor)) break;
-      count++;
-      cursor = addDays(cursor, -1); // ALWAYS move back one day
-    }
-
-    return { current: count, lastCountedDay: anchor };
-  }, [logs, todayYMD]);
-
-  // 1) Check auth on load
+  // Auth boot
   useEffect(() => {
     async function boot() {
       setMsg("");
 
-      if (!supabaseUrl || !supabaseAnonKey) {
-        setMsg(
-          "Missing env vars. Add NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY then restart."
-        );
-        setLoading(false);
-        return;
-      }
-
       const { data } = await supabase.auth.getUser();
-
       if (!data.user) {
         router.push("/login");
         return;
       }
-
       setUserId(data.user.id);
     }
-
     boot();
   }, [router]);
 
-  // 2) Fetch logs once we have userId
+  // Fetch logs
   useEffect(() => {
     if (!userId) return;
 
     async function fetchLogs() {
-      setMsg("");
       setLoading(true);
-
       const { data, error } = await supabase
         .from("daily_logs")
         .select("*")
@@ -198,7 +155,6 @@ export default function Home() {
 
   async function refetch() {
     if (!userId) return;
-
     const { data, error } = await supabase
       .from("daily_logs")
       .select("*")
@@ -210,27 +166,89 @@ export default function Home() {
       setLogs([]);
       return;
     }
-
     setLogs((data as DailyLog[]) ?? []);
   }
 
-  const todayTargets = useMemo(() => {
+  // Weekly windows
+  const start7 = useMemo(() => addDays(todayYMD, -6), [todayYMD]);
+  const prevStart7 = useMemo(() => addDays(start7, -7), [start7]);
+
+  const last7 = useMemo(() => logs.filter((l) => l.log_date >= start7), [logs, start7]);
+  const prev7 = useMemo(() => logs.filter((l) => l.log_date >= prevStart7 && l.log_date < start7), [logs, prevStart7, start7]);
+
+  // Weekly totals + avg score
+  const weekly = useMemo(() => {
+    const totals = last7.reduce(
+      (a, l) => {
+        a.calls += l.calls;
+        a.meetings += l.meetings;
+        a.skill += l.skill_minutes;
+        return a;
+      },
+      { calls: 0, meetings: 0, skill: 0 }
+    );
+    const avgScore = avg(last7.map(score));
+    return { ...totals, avgScore, daysLogged: last7.length };
+  }, [last7]);
+
+  // Trend (avg score last7 vs prev7)
+  const trend = useMemo(() => {
+    const lastAvg = avg(last7.map(score));
+    const prevAvg = avg(prev7.map(score));
+    const delta = lastAvg - prevAvg;
+    return { lastAvg, prevAvg, delta, dir: delta > 0 ? "up" : delta < 0 ? "down" : "flat" };
+  }, [last7, prev7]);
+
+  // Streak (2/3 targets)
+  const streak = useMemo(() => {
+    if (!logs.length) return 0;
+
+    const byDate = new Map<string, DailyLog>();
+    for (const l of logs) byDate.set(l.log_date, l);
+
+    const counts = (ymd: string) => {
+      const l = byDate.get(ymd);
+      return l ? isStreakDay(l) : false;
+    };
+
+    const yesterday = addDays(todayYMD, -1);
+
+    let anchor: string | null = null;
+    if (counts(todayYMD)) anchor = todayYMD;
+    else if (counts(yesterday)) anchor = yesterday;
+    else return 0;
+
+    let count = 0;
+    let cursor = anchor;
+
+    for (let i = 0; i < 365; i++) {
+      if (!counts(cursor)) break;
+      count++;
+      cursor = addDays(cursor, -1);
+    }
+    return count;
+  }, [logs, todayYMD]);
+
+  // Today stats
+  const todayStats = useMemo(() => {
     if (!todayLog) return null;
-
-    const callsPct = pct(todayLog.calls, TARGETS.calls);
-    const meetingsPct = pct(todayLog.meetings, TARGETS.meetings);
-    const skillPct = pct(todayLog.skill_minutes, TARGETS.skill_minutes);
-
     return {
-      callsPct,
-      meetingsPct,
-      skillPct,
-      callsHit: todayLog.calls >= TARGETS.calls,
-      meetingsHit: todayLog.meetings >= TARGETS.meetings,
-      skillHit: todayLog.skill_minutes >= TARGETS.skill_minutes,
-      hits: hitCountForDay(todayLog),
+      hits: hitCount(todayLog),
+      score: score(todayLog),
+      callsPct: pct(todayLog.calls, TARGETS.calls),
+      meetingsPct: pct(todayLog.meetings, TARGETS.meetings),
+      skillPct: pct(todayLog.skill_minutes, TARGETS.skill_minutes),
     };
   }, [todayLog]);
+
+  // Chart values (last 14 days)
+  const sparkValues = useMemo(() => {
+    const start14 = addDays(todayYMD, -13);
+    const slice = logs
+      .filter((l) => l.log_date >= start14)
+      .sort((a, b) => a.log_date.localeCompare(b.log_date));
+    return slice.map(score);
+  }, [logs, todayYMD]);
 
   return (
     <div style={styles.page}>
@@ -238,19 +256,29 @@ export default function Home() {
         <div style={styles.headerRow}>
           <div>
             <h1 style={styles.h1}>Apexor</h1>
-            <p style={styles.sub}>Daily performance log</p>
+            <p style={styles.sub}>Phase 2 – Performance Intelligence</p>
           </div>
 
           <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
             <div style={styles.pill}>{todayYMD}</div>
-            <div style={styles.streakPill}>
-              🔥 Streak:{" "}
-              {streak.current > 0 ? `${streak.current} day${streak.current === 1 ? "" : "s"}` : "0"}
-            </div>
+            <div style={styles.streakPill}>🔥 Streak: {streak}</div>
           </div>
         </div>
 
         {msg ? <div style={styles.noteBox}>{msg}</div> : null}
+
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+          <div style={{ fontSize: 13, opacity: 0.75 }}>
+            Trend (avg score):{" "}
+            <strong>
+              {trend.dir === "up" ? "▲" : trend.dir === "down" ? "▼" : "■"} {trend.delta}
+            </strong>{" "}
+            (last {trend.lastAvg} vs prev {trend.prevAvg})
+          </div>
+          <div>
+            <Sparkline values={sparkValues} />
+          </div>
+        </div>
 
         <h2 style={styles.h2}>Today</h2>
 
@@ -261,53 +289,28 @@ export default function Home() {
         ) : todayLog && !editingToday ? (
           <>
             <div style={{ marginBottom: 10, opacity: 0.75 }}>
-              Streak day rule: hit <strong>2 out of 3</strong> targets (calls / meetings / skill)
-              {todayTargets ? (
-                <>
-                  {" "}
-                  • Today hits: <strong>{todayTargets.hits}/3</strong>
-                </>
-              ) : null}
+              Rule: streak day = hit <strong>2/3</strong> targets • Hits:{" "}
+              <strong>{todayStats?.hits ?? 0}/3</strong> • Score:{" "}
+              <strong>{todayStats?.score ?? 0}/100</strong>
             </div>
 
             <div style={styles.grid}>
-              <TargetStat
-                label="Calls"
-                value={todayLog.calls}
-                target={TARGETS.calls}
-                percent={todayTargets?.callsPct ?? 0}
-                hit={todayTargets?.callsHit ?? false}
-              />
-              <TargetStat
-                label="Meetings"
-                value={todayLog.meetings}
-                target={TARGETS.meetings}
-                percent={todayTargets?.meetingsPct ?? 0}
-                hit={todayTargets?.meetingsHit ?? false}
-              />
-              <TargetStat
-                label="Skill minutes"
-                value={todayLog.skill_minutes}
-                target={TARGETS.skill_minutes}
-                percent={todayTargets?.skillPct ?? 0}
-                hit={todayTargets?.skillHit ?? false}
-              />
+              <TargetStat label="Calls" value={todayLog.calls} target={TARGETS.calls} percent={todayStats?.callsPct ?? 0} />
+              <TargetStat label="Meetings" value={todayLog.meetings} target={TARGETS.meetings} percent={todayStats?.meetingsPct ?? 0} />
+              <TargetStat label="Skill minutes" value={todayLog.skill_minutes} target={TARGETS.skill_minutes} percent={todayStats?.skillPct ?? 0} />
               <div style={styles.stat}>
                 <div style={styles.statLabel}>Notes</div>
                 <div style={styles.statValueText}>{todayLog.notes ?? "-"}</div>
               </div>
             </div>
 
-            <button
-              style={{ ...styles.button, marginTop: 12 }}
-              onClick={() => setEditingToday(true)}
-            >
+            <button style={{ ...styles.button, marginTop: 12 }} onClick={() => setEditingToday(true)}>
               Edit
             </button>
           </>
         ) : (
           <TodayForm
-            userId={userId}
+            userId={userId!}
             todayYMD={todayYMD}
             defaultCalls={todayLog?.calls ?? 0}
             defaultMeetings={todayLog?.meetings ?? 0}
@@ -324,46 +327,27 @@ export default function Home() {
           />
         )}
 
-        <h2 style={{ ...styles.h2, marginTop: 28 }}>Weekly summary (last 7 days)</h2>
+        <h2 style={{ ...styles.h2, marginTop: 28 }}>Weekly analytics (last 7 days)</h2>
 
         {loading ? (
           <div>Loading…</div>
         ) : (
           <>
-            <div style={{ opacity: 0.7, marginBottom: 10 }}>
-              From {weekSummary.startYMD} to {todayYMD}
+            <div style={{ opacity: 0.75, marginBottom: 10 }}>
+              Days logged: <strong>{weekly.daysLogged}</strong> • Avg score: <strong>{weekly.avgScore}</strong>
             </div>
 
             <div style={styles.grid}>
+              <TargetStat label="Calls" value={weekly.calls} target={TARGETS.calls * 7} percent={pct(weekly.calls, TARGETS.calls * 7)} />
+              <TargetStat label="Meetings" value={weekly.meetings} target={TARGETS.meetings * 7} percent={pct(weekly.meetings, TARGETS.meetings * 7)} />
+              <TargetStat label="Skill minutes" value={weekly.skill} target={TARGETS.skill_minutes * 7} percent={pct(weekly.skill, TARGETS.skill_minutes * 7)} />
               <div style={styles.stat}>
-                <div style={styles.statLabel}>Days logged</div>
-                <div style={styles.statValue}>{weekSummary.daysLogged}</div>
+                <div style={styles.statLabel}>Weekly targets</div>
+                <div style={styles.statValue}>7 days</div>
                 <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-                  Target: 7
+                  Calls {TARGETS.calls}/day • Meetings {TARGETS.meetings}/day • Skill {TARGETS.skill_minutes}/day
                 </div>
               </div>
-
-              <TargetStat
-                label="Calls"
-                value={weekSummary.calls}
-                target={TARGETS.calls * 7}
-                percent={pct(weekSummary.calls, TARGETS.calls * 7)}
-                hit={weekSummary.calls >= TARGETS.calls * 7}
-              />
-              <TargetStat
-                label="Meetings"
-                value={weekSummary.meetings}
-                target={TARGETS.meetings * 7}
-                percent={pct(weekSummary.meetings, TARGETS.meetings * 7)}
-                hit={weekSummary.meetings >= TARGETS.meetings * 7}
-              />
-              <TargetStat
-                label="Skill minutes"
-                value={weekSummary.skill}
-                target={TARGETS.skill_minutes * 7}
-                percent={pct(weekSummary.skill, TARGETS.skill_minutes * 7)}
-                hit={weekSummary.skill >= TARGETS.skill_minutes * 7}
-              />
             </div>
           </>
         )}
@@ -383,6 +367,7 @@ export default function Home() {
                   <th style={styles.th}>Calls</th>
                   <th style={styles.th}>Meetings</th>
                   <th style={styles.th}>Skill</th>
+                  <th style={styles.th}>Score</th>
                   <th style={styles.th}>Notes</th>
                 </tr>
               </thead>
@@ -393,6 +378,7 @@ export default function Home() {
                     <td style={styles.td}>{l.calls}</td>
                     <td style={styles.td}>{l.meetings}</td>
                     <td style={styles.td}>{l.skill_minutes}</td>
+                    <td style={styles.td}>{score(l)}</td>
                     <td style={styles.td}>{l.notes ?? "-"}</td>
                   </tr>
                 ))}
@@ -405,46 +391,19 @@ export default function Home() {
   );
 }
 
-function TargetStat({
-  label,
-  value,
-  target,
-  percent,
-  hit,
-}: {
-  label: string;
-  value: number;
-  target: number;
-  percent: number;
-  hit: boolean;
-}) {
+function TargetStat({ label, value, target, percent }: { label: string; value: number; target: number; percent: number }) {
+  const hit = value >= target;
   return (
     <div style={styles.stat}>
       <div style={styles.statLabel}>{label}</div>
       <div style={styles.statValue}>{value}</div>
-
       <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
         Target: {target} • {percent}%
       </div>
-
       <div style={styles.progressOuter}>
-        <div
-          style={{
-            ...styles.progressInner,
-            width: `${percent}%`,
-            background: hit ? "#16a34a" : "#ef4444",
-          }}
-        />
+        <div style={{ ...styles.progressInner, width: `${percent}%`, background: hit ? "#16a34a" : "#ef4444" }} />
       </div>
-
-      <div
-        style={{
-          marginTop: 8,
-          fontSize: 12,
-          fontWeight: 700,
-          color: hit ? "#16a34a" : "#ef4444",
-        }}
-      >
+      <div style={{ marginTop: 8, fontSize: 12, fontWeight: 700, color: hit ? "#16a34a" : "#ef4444" }}>
         {hit ? "HIT" : "MISS"}
       </div>
     </div>
@@ -517,55 +476,30 @@ function TodayForm({
     <div style={styles.form}>
       <div style={styles.formRow}>
         <label style={styles.label}>Calls</label>
-        <input
-          style={styles.input}
-          type="number"
-          value={calls}
-          onChange={(e) => setCalls(Number(e.target.value))}
-        />
+        <input style={styles.input} type="number" value={calls} onChange={(e) => setCalls(Number(e.target.value))} />
       </div>
 
       <div style={styles.formRow}>
         <label style={styles.label}>Meetings</label>
-        <input
-          style={styles.input}
-          type="number"
-          value={meetings}
-          onChange={(e) => setMeetings(Number(e.target.value))}
-        />
+        <input style={styles.input} type="number" value={meetings} onChange={(e) => setMeetings(Number(e.target.value))} />
       </div>
 
       <div style={styles.formRow}>
         <label style={styles.label}>Skill minutes</label>
-        <input
-          style={styles.input}
-          type="number"
-          value={skillMinutes}
-          onChange={(e) => setSkillMinutes(Number(e.target.value))}
-        />
+        <input style={styles.input} type="number" value={skillMinutes} onChange={(e) => setSkillMinutes(Number(e.target.value))} />
       </div>
 
       <div style={styles.formRow}>
         <label style={styles.label}>Notes</label>
-        <textarea
-          style={styles.textarea}
-          value={notes}
-          onChange={(e) => setNotes(e.target.value)}
-          placeholder="Optional"
-        />
+        <textarea style={styles.textarea} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Optional" />
       </div>
 
       <div style={{ display: "flex", gap: 10 }}>
         <button style={styles.button} onClick={save} disabled={saving}>
           {saving ? "Saving…" : "Save today"}
         </button>
-
         {onCancel ? (
-          <button
-            style={{ ...styles.button, background: "#e5e7eb", color: "#111827" }}
-            onClick={onCancel}
-            disabled={saving}
-          >
+          <button style={{ ...styles.button, background: "#e5e7eb", color: "#111827" }} onClick={onCancel} disabled={saving}>
             Cancel
           </button>
         ) : null}
@@ -575,132 +509,30 @@ function TodayForm({
 }
 
 const styles: Record<string, React.CSSProperties> = {
-  page: {
-    minHeight: "100vh",
-    background: "#f6f7fb",
-    padding: 32,
-    fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif",
-  },
-  card: {
-    maxWidth: 980,
-    margin: "0 auto",
-    background: "white",
-    borderRadius: 14,
-    padding: 24,
-    boxShadow: "0 10px 30px rgba(0,0,0,0.06)",
-  },
-  headerRow: {
-    display: "flex",
-    alignItems: "flex-start",
-    justifyContent: "space-between",
-    gap: 12,
-    marginBottom: 16,
-  },
+  page: { minHeight: "100vh", background: "#f6f7fb", padding: 32, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" },
+  card: { maxWidth: 980, margin: "0 auto", background: "white", borderRadius: 14, padding: 24, boxShadow: "0 10px 30px rgba(0,0,0,0.06)" },
+  headerRow: { display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, marginBottom: 16 },
   h1: { margin: 0, fontSize: 32, letterSpacing: -0.5 },
   sub: { margin: "6px 0 0", opacity: 0.7 },
-  pill: {
-    padding: "8px 12px",
-    background: "#111827",
-    color: "white",
-    borderRadius: 999,
-    fontSize: 12,
-  },
-  streakPill: {
-    padding: "6px 10px",
-    background: "#f3f4f6",
-    color: "#111827",
-    borderRadius: 999,
-    fontSize: 12,
-    border: "1px solid #e5e7eb",
-  },
+  pill: { padding: "8px 12px", background: "#111827", color: "white", borderRadius: 999, fontSize: 12 },
+  streakPill: { padding: "6px 10px", background: "#f3f4f6", color: "#111827", borderRadius: 999, fontSize: 12, border: "1px solid #e5e7eb" },
   h2: { margin: "18px 0 10px", fontSize: 18 },
-  grid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
-    gap: 12,
-  },
-  stat: {
-    border: "1px solid #e5e7eb",
-    borderRadius: 12,
-    padding: 12,
-    background: "#fafafa",
-  },
+  grid: { display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 12, marginTop: 10 },
+  stat: { border: "1px solid #e5e7eb", borderRadius: 12, padding: 12, background: "#fafafa" },
   statLabel: { fontSize: 12, opacity: 0.7, marginBottom: 6 },
   statValue: { fontSize: 22, fontWeight: 700 },
   statValueText: { fontSize: 14, lineHeight: 1.3 },
-  progressOuter: {
-    marginTop: 8,
-    height: 10,
-    width: "100%",
-    background: "#e5e7eb",
-    borderRadius: 999,
-    overflow: "hidden",
-  },
-  progressInner: {
-    height: "100%",
-    borderRadius: 999,
-  },
-  form: {
-    border: "1px solid #e5e7eb",
-    borderRadius: 12,
-    padding: 14,
-    background: "#fafafa",
-    maxWidth: 520,
-  },
-  formRow: {
-    display: "grid",
-    gridTemplateColumns: "140px 1fr",
-    gap: 10,
-    marginBottom: 10,
-    alignItems: "center",
-  },
+  progressOuter: { marginTop: 8, height: 10, width: "100%", background: "#e5e7eb", borderRadius: 999, overflow: "hidden" },
+  progressInner: { height: "100%", borderRadius: 999 },
+  form: { border: "1px solid #e5e7eb", borderRadius: 12, padding: 14, background: "#fafafa", maxWidth: 520 },
+  formRow: { display: "grid", gridTemplateColumns: "140px 1fr", gap: 10, marginBottom: 10, alignItems: "center" },
   label: { fontSize: 13, opacity: 0.85 },
-  input: {
-    padding: "10px 12px",
-    borderRadius: 10,
-    border: "1px solid #d1d5db",
-    outline: "none",
-  },
-  textarea: {
-    padding: "10px 12px",
-    borderRadius: 10,
-    border: "1px solid #d1d5db",
-    outline: "none",
-    minHeight: 70,
-    resize: "vertical",
-  },
-  button: {
-    padding: "10px 14px",
-    borderRadius: 10,
-    border: "none",
-    background: "#111827",
-    color: "white",
-    cursor: "pointer",
-    fontWeight: 600,
-  },
-  tableWrap: {
-    overflowX: "auto",
-    border: "1px solid #e5e7eb",
-    borderRadius: 12,
-  },
+  input: { padding: "10px 12px", borderRadius: 10, border: "1px solid #d1d5db", outline: "none" },
+  textarea: { padding: "10px 12px", borderRadius: 10, border: "1px solid #d1d5db", outline: "none", minHeight: 70, resize: "vertical" },
+  button: { padding: "10px 14px", borderRadius: 10, border: "none", background: "#111827", color: "white", cursor: "pointer", fontWeight: 600 },
+  tableWrap: { overflowX: "auto", border: "1px solid #e5e7eb", borderRadius: 12, marginTop: 10 },
   table: { width: "100%", borderCollapse: "collapse" },
-  th: {
-    textAlign: "left",
-    padding: 12,
-    fontSize: 12,
-    background: "#f3f4f6",
-    borderBottom: "1px solid #e5e7eb",
-  },
-  td: {
-    padding: 12,
-    borderBottom: "1px solid #f1f5f9",
-    fontSize: 13,
-  },
-  noteBox: {
-    padding: 12,
-    borderRadius: 12,
-    background: "#ecfeff",
-    border: "1px solid #a5f3fc",
-    marginBottom: 12,
-  },
+  th: { textAlign: "left", padding: 12, fontSize: 12, background: "#f3f4f6", borderBottom: "1px solid #e5e7eb" },
+  td: { padding: 12, borderBottom: "1px solid #f1f5f9", fontSize: 13 },
+  noteBox: { padding: 12, borderRadius: 12, background: "#ecfeff", border: "1px solid #a5f3fc", marginBottom: 12 },
 };
